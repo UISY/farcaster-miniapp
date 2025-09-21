@@ -1,123 +1,161 @@
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
-import requests
-import time
+import requests, time
 
 app = FastAPI()
 
-# Besucherzähler
+# --- Besucherzähler (einfach, im Speicher; reset bei Neustart/Deploy) ---
 visitors = 0
 
-# ETH Preis Cache
-last_price = None
-last_update = 0
+# --- Preis-Cache gegen Rate-Limit ---
+_last_price = None
+_last_update = 0  # epoch seconds
 
 def fetch_eth_price():
-    """
-    Holt den aktuellen Ethereum-Preis von CoinGecko.
-    Cached den Wert 30 Sekunden, um 429 Fehler zu vermeiden.
-    """
-    global last_price, last_update
+    """ETH-USD von CoinGecko, mit 30s Cache & robustem Fallback."""
+    global _last_price, _last_update
     now = time.time()
 
-    if last_price is None or (now - last_update) > 30:
+    # Nur alle 30s extern anfragen
+    if _last_price is None or (now - _last_update) > 30:
         try:
             url = "https://api.coingecko.com/api/v3/simple/price"
             params = {"ids": "ethereum", "vs_currencies": "usd"}
             r = requests.get(url, params=params, timeout=10)
             r.raise_for_status()
             data = r.json()
-            last_price = data["ethereum"]["usd"]
-            last_update = now
+            _last_price = float(data["ethereum"]["usd"])
+            _last_update = now
         except Exception as e:
-            print("⚠️ Fehler bei CoinGecko:", e)
-            if last_price is None:
-                last_price = 0
-    return last_price
+            # Bei Fehler: letzten bekannten Wert behalten; wenn keiner, 0.0
+            print("⚠️ CoinGecko-Fehler:", e)
+            if _last_price is None:
+                _last_price = 0.0
+    return _last_price
 
 
 @app.get("/", response_class=HTMLResponse)
 def home():
     global visitors
-    visitors += 1
+    visitors += 1  # zählt Seitenaufrufe (nur unter Preis anzeigen)
 
-    html_content = """
-    <!DOCTYPE html>
-    <html lang="de">
-    <head>
-        <meta charset="UTF-8">
-        <title>Ethereum MiniApp</title>
-        <style>
-            body {
-                font-family: Arial, sans-serif;
-                background-color: #f5f6fa;
-                display: flex;
-                flex-direction: column;
-                justify-content: center;
-                align-items: center;
-                height: 100vh;
-                margin: 0;
-            }
-            .logo, .price-box {
-                cursor: pointer;
-                text-align: center;
-            }
-            .logo img {
-                width: 150px;
-                height: auto;
-            }
-            .price {
-                font-size: 42px;
-                font-weight: bold;
-            }
-            .visitors {
-                margin-top: 10px;
-                font-size: 18px;
-                font-weight: bold;
-            }
-        </style>
-    </head>
-    <body>
-        <div id="content" class="logo" onclick="toggleView()">
-            <img src="https://upload.wikimedia.org/wikipedia/commons/6/6f/Ethereum-icon-purple.svg" alt="Ethereum Logo">
-        </div>
+    html = f"""
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+  <title>Ethereum MiniApp</title>
+  <style>
+    :root {{
+      --bg:#f4f4f9; --text:#1f2937; --up:#16a34a; --down:#dc2626;
+    }}
+    html,body {{ height:100%; margin:0; }}
+    body {{
+      display:flex; align-items:center; justify-content:center;
+      background:var(--bg);
+      font-family: "Arial Black", Arial, Helvetica, sans-serif;
+      color:var(--text);
+    }}
+    .wrap {{ text-align:center; user-select:none; }}
+    #logo {{
+      width: 160px; height:auto; display:block; margin:0 auto;
+    }}
+    #panel {{ display:none; }}
+    #price {{
+      font-size: clamp(32px,7vw,64px);
+      font-weight: 700; margin: 0 0 8px 0;
+    }}
+    #vis {{ font-size: clamp(14px,4vw,20px); color:#6b7280; margin:0; }}
 
-        <script>
-            let showingPrice = false;
-            async function toggleView() {
-                const content = document.getElementById("content");
-                if (showingPrice) {
-                    // Zurück zum Logo
-                    content.className = "logo";
-                    content.innerHTML = '<img src="https://upload.wikimedia.org/wikipedia/commons/6/6f/Ethereum-icon-purple.svg" alt="Ethereum Logo">';
-                    showingPrice = false;
-                } else {
-                    // ETH-Preis laden
-                    try {
-                        const res = await fetch('/price');
-                        const data = await res.json();
-                        content.className = "price-box";
-                        content.innerHTML = `
-                            <div class="price">$${data.price}</div>
-                            <div class="visitors">Besucher: ${data.visitors}</div>
-                        `;
-                        showingPrice = true;
-                    } catch (err) {
-                        content.innerHTML = "<div>Fehler beim Laden des Preises</div>";
-                    }
-                }
-            }
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
+    @keyframes flashUp   {{ 0%{{color:var(--up)}}   100%{{color:var(--text)}} }}
+    @keyframes flashDown {{ 0%{{color:var(--down)}} 100%{{color:var(--text)}} }}
+  </style>
+</head>
+<body>
+  <div class="wrap" id="wrap">
+    <!-- Start: nur Logo -->
+    <img id="logo"
+         src="https://assets.coingecko.com/coins/images/279/large/ethereum.png?1696501628"
+         onerror="this.src='https://upload.wikimedia.org/wikipedia/commons/6/6f/Ethereum-icon-purple.svg'"
+         alt="Ethereum" />
+
+    <!-- Preis-Panel (versteckt bis zum Klick) -->
+    <div id="panel">
+      <div id="price">$0.00</div>
+      <p id="vis">👥 {visitors} Besucher</p>
+    </div>
+  </div>
+
+  <script>
+    let showing = false;
+    let timerId = null;
+    let lastPrice = null;
+
+    const wrap  = document.getElementById('wrap');
+    const logo  = document.getElementById('logo');
+    const panel = document.getElementById('panel');
+    const priceEl = document.getElementById('price');
+    const visEl = document.getElementById('vis');
+
+    // Toggle auf JEDEN Klick im zentralen Bereich
+    wrap.addEventListener('click', async () => {{
+      showing = !showing;
+      if (showing) {{
+        // Logo aus, Panel an
+        logo.style.display = 'none';
+        panel.style.display = 'block';
+
+        await updatePrice();                // sofort
+        if (!timerId) timerId = setInterval(updatePrice, 5000); // dann alle 5s
+      }} else {{
+        // Panel aus, Logo an
+        panel.style.display = 'none';
+        logo.style.display = 'block';
+        if (timerId) {{ clearInterval(timerId); timerId = null; }}
+      }}
+    }});
+
+    async function updatePrice() {{
+      try {{
+        const res = await fetch('/price');
+        const data = await res.json();
+        const newPrice = Number(data.price || 0);
+
+        // Animation je nach Bewegung
+        if (lastPrice !== null) {{
+          if (newPrice > lastPrice) {{
+            priceEl.style.animation = 'flashUp 0.5s';
+          }} else if (newPrice < lastPrice) {{
+            priceEl.style.animation = 'flashDown 0.5s';
+          }} else {{
+            priceEl.style.animation = 'none';
+          }}
+        }}
+        lastPrice = newPrice;
+
+        // Formatierte Ausgabe
+        priceEl.textContent = new Intl.NumberFormat('en-US', {{
+          style: 'currency', currency: 'USD', maximumFractionDigits: 2
+        }}).format(newPrice);
+
+        // Besucherzahl wird nur im Panel gezeigt (steht schon drin)
+        // visEl bleibt sichtbar, Logo-Ansicht zeigt sie nicht
+      }} catch (e) {{
+        console.error(e);
+      }}
+    }}
+  </script>
+</body>
+</html>
+"""
+    return HTMLResponse(html)
 
 
 @app.get("/price", response_class=JSONResponse)
-def get_price():
-    price = fetch_eth_price()
-    return {"price": price, "visitors": visitors}
+def price():
+    p = fetch_eth_price()
+    return {"price": p}
 
 
 
